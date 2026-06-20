@@ -31,5 +31,6 @@
 //! ```
 
 mod converter;
+mod dom;
 
 pub use converter::{Error, convert};
