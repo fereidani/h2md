@@ -483,10 +483,12 @@ fn th_outside_thead() {
 
 #[test]
 fn inline_with_marker_chars() {
+    // The literal `**` in the text is escaped (`\*\*`), so there is no bare
+    // marker run in the rendered content and the `**` delimiter is safe.
     let md = h("<strong>a ** b</strong>");
     assert!(
-        md.contains("__a ** b__"),
-        "uses alternative delimiter: {md:?}"
+        md.contains("**a \\*\\* b**"),
+        "escapes literal markers in content: {md:?}"
     );
 }
 
@@ -655,4 +657,159 @@ fn deeply_nested_html_returns_error() {
             "error should mention depth: {e}"
         );
     }
+}
+
+// Markdown escaping of text content
+
+#[test]
+fn escapes_asterisks_in_text() {
+    // A literal `*` in HTML text must not round-trip as emphasis.
+    let md = h("<p>a * b</p>");
+    assert!(md.contains(r"a \* b"), "literal asterisk escaped: {md:?}");
+}
+
+#[test]
+fn escapes_underscore_in_text() {
+    let md = h("<p>foo_bar_baz</p>");
+    assert!(
+        md.contains(r"foo\_bar\_baz"),
+        "literal underscores escaped: {md:?}"
+    );
+}
+
+#[test]
+fn escapes_hash_only_at_line_start() {
+    // `#` mid-line is literal and must NOT be escaped; only a line-start
+    // `#` (which would start a heading) is escaped.
+    let md = h("<p>issue #42 is fine</p>");
+    assert!(
+        !md.contains(r"\#"),
+        "mid-line hash should not be escaped: {md:?}"
+    );
+
+    // A `#` that begins a paragraph's output line is escaped.
+    let md = h("<p># not a heading</p>");
+    assert!(
+        md.contains(r"\# not a heading"),
+        "leading hash should be escaped: {md:?}"
+    );
+}
+
+#[test]
+fn escapes_less_than_in_text() {
+    // `<b>` in body text would otherwise be consumed as an HTML tag.
+    let md = h("<p>a < b > c</p>");
+    assert!(md.contains(r"a \< b"), "literal less-than escaped: {md:?}");
+}
+
+#[test]
+fn does_not_escape_inside_code_span() {
+    // Code spans emit raw text; no Markdown escaping is applied.
+    let md = h("<code>a * b _ c</code>");
+    assert_eq!(md, "`a * b _ c`");
+}
+
+#[test]
+fn does_not_escape_inside_pre() {
+    let md = h("<pre>a * b _ c\n</pre>");
+    assert!(
+        md.contains("a * b _ c"),
+        "pre content should not be escaped: {md:?}"
+    );
+}
+
+// Empty inline elements
+
+#[test]
+fn empty_strong_emits_nothing() {
+    let md = h("<strong></strong><p>after</p>");
+    assert!(
+        !md.contains("**"),
+        "empty strong should emit no markers: {md:?}"
+    );
+    assert!(md.contains("after"), "after text present: {md:?}");
+}
+
+#[test]
+fn empty_em_emits_nothing() {
+    let md = h("<em></em>visible");
+    assert!(!md.contains('*'), "empty em should emit no markers: {md:?}");
+    assert!(md.contains("visible"), "visible text present: {md:?}");
+}
+
+// URL emission edge cases
+
+#[test]
+fn link_url_with_angle_brackets_wrapped() {
+    let md = h(r#"<a href="http://example.com/a<b>c">x</a>"#);
+    assert!(
+        md.contains("[x](<http://example.com/a\\<b\\>c>)"),
+        "URL with < > wrapped and inner-escaped: {md:?}"
+    );
+}
+
+#[test]
+fn plain_link_url_not_wrapped() {
+    let md = h(r#"<a href="https://example.com/path">x</a>"#);
+    assert_eq!(md, "[x](https://example.com/path)");
+}
+
+// Table column alignment for non-ASCII
+
+#[test]
+fn table_aligns_wide_characters() {
+    let md = h("<table>\
+         <tr><th>Name</th><th>Age</th></tr>\
+         <tr><td>Alice</td><td>30</td></tr>\
+         <tr><td>日本</td><td>25</td></tr>\
+         </table>");
+    // The header and the wide-char row must pad to the same display width so
+    // the closing pipes line up. Both rows should end with "| Age |" / "| 25 |"
+    // at the same visual column.
+    assert!(md.contains("| Name  | Age |"), "header row aligned: {md:?}");
+    assert!(
+        md.contains("| 日本  | 25  |"),
+        "wide-char row aligned by display width: {md:?}"
+    );
+}
+
+#[test]
+fn table_escapes_pipe_in_cell() {
+    let md = h("<table><tr><td>a|b</td></tr></table>");
+    assert!(md.contains(r"a\|b"), "pipe in cell escaped: {md:?}");
+}
+
+// Nested tables and block content inside cells
+
+#[test]
+fn nested_table_does_not_corrupt_outer_table() {
+    let md = h("<table>\
+         <tr><td>a</td><td><table><tr><td>x</td></tr></table></td></tr>\
+         <tr><td>b</td><td>y</td></tr>\
+         </table>");
+    // The output must be a valid single table with two data rows, not the
+    // garbled interleaving produced before the fix.
+    let lines: Vec<&str> = md.lines().filter(|l| l.starts_with('|')).collect();
+    assert!(
+        lines.len() >= 3,
+        "expected a header/sep/data layout, got: {md:?}"
+    );
+    // No row should contain a stray unescaped nested-table fragment.
+    assert!(md.contains('a'), "outer cell a present: {md:?}");
+    assert!(md.contains('y'), "sibling cell y present: {md:?}");
+}
+
+#[test]
+fn list_inside_table_cell_is_single_line() {
+    let md = h("<table><tr><td><ul><li>a</li><li>b</li></ul></td></tr></table>");
+    // The cell content is flattened to one line; no raw newlines leak into the
+    // row and break the table.
+    let row = md
+        .lines()
+        .find(|l| l.contains('a') && l.contains('b'))
+        .unwrap_or_else(|| panic!("no row with list items: {md:?}"));
+    assert!(
+        row.starts_with('|') && row.ends_with('|'),
+        "list-in-cell stays on one table row: {row:?}"
+    );
 }

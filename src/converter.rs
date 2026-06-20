@@ -20,9 +20,14 @@
 //! - All error paths use proper `Result` propagation
 //! - Debug assertions verify invariants in debug builds
 
-use std::{cell::RefCell, fmt, io::{self, Write}};
+use std::{
+    cell::RefCell,
+    fmt,
+    io::{self, Write},
+};
 
 use html5ever::Attribute;
+use unicode_width::UnicodeWidthStr;
 
 use crate::dom::{Handle, NodeData, RcDom, iter_children};
 
@@ -78,6 +83,8 @@ pub fn convert<W: Write>(html: &[u8], out: &mut W) -> Result<(), Error> {
         list_stack: Vec::new(),
         table_stack: Vec::new(),
         code_buf: String::new(),
+        text_buf: String::new(),
+        row_buf: String::new(),
         depth: 0,
     };
     cvt.walk(&dom.document)?;
@@ -88,7 +95,10 @@ pub fn convert<W: Write>(html: &[u8], out: &mut W) -> Result<(), Error> {
 /// Maximum recursion depth to prevent stack overflow on malicious HTML.
 const MAX_DEPTH: u32 = 200;
 
-/// Pre-computed indent strings for list nesting depths (0–15 levels = 0–30
+/// Markdown heading prefixes indexed by heading level (1-6); index 0 unused.
+const HASHES: [&str; 7] = ["", "#", "##", "###", "####", "#####", "######"];
+
+/// Pre-computed indent strings for list nesting depths (0-15 levels = 0-30
 /// spaces).
 const LIST_INDENTS: [&str; 16] = [
     "",
@@ -138,6 +148,8 @@ struct Converter<'a, W: Write> {
     list_stack: Vec<ListInfo>,
     table_stack: Vec<TableState>,
     code_buf: String,
+    text_buf: String,
+    row_buf: String,
     depth: u32,
 }
 
@@ -149,7 +161,6 @@ struct ListInfo {
 struct TableState {
     rows: Vec<TableRow>,
     current_row: Vec<String>,
-    current_cell: Vec<u8>,
     in_header: bool,
     current_row_has_th: bool,
 }
@@ -159,7 +170,7 @@ struct TableRow {
     is_header: bool,
 }
 
-impl<'a, W: Write> Converter<'a, W> {
+impl<W: Write> Converter<'_, W> {
     fn finalize(&mut self) -> io::Result<()> {
         if self.trailing_nls == 0 {
             self.out.write_all(b"\n")?;
@@ -256,7 +267,6 @@ impl<'a, W: Write> Converter<'a, W> {
             "li" => self.handle_list_item(handle),
             "table" => self.handle_table(handle),
             "thead" => self.handle_thead(handle),
-            "tbody" | "tfoot" => self.walk_children(handle),
             "tr" => self.handle_tr(handle),
             "th" => self.handle_cell(true, handle),
             "td" => self.handle_cell(false, handle),
@@ -267,6 +277,8 @@ impl<'a, W: Write> Converter<'a, W> {
             "a" => self.handle_link(attrs, handle),
             "img" => self.handle_image(attrs),
             "script" | "style" | "noscript" | "head" | "meta" | "link" => Ok(()),
+            // `tbody`, `tfoot`, and unrecognized elements: render children
+            // directly without adding block spacing.
             _ => self.walk_children(handle),
         }
     }
@@ -275,7 +287,6 @@ impl<'a, W: Write> Converter<'a, W> {
 
     fn handle_heading(&mut self, level: usize, handle: &Handle) -> io::Result<()> {
         self.ensure_blank_line()?;
-        const HASHES: [&str; 7] = ["", "#", "##", "###", "####", "#####", "######"];
         debug_assert!((1..=6).contains(&level));
         self.emit(HASHES[level])?;
         self.emit(" ")?;
@@ -326,7 +337,7 @@ impl<'a, W: Write> Converter<'a, W> {
 
     fn handle_pre(&mut self, handle: &Handle) -> io::Result<()> {
         self.ensure_blank_line()?;
-        let lang = self.extract_code_language(handle);
+        let lang = extract_code_language(handle);
         self.emit("```")?;
         if let Some(ref l) = lang {
             self.emit(l)?;
@@ -440,12 +451,14 @@ impl<'a, W: Write> Converter<'a, W> {
     // Tables
 
     fn handle_table(&mut self, handle: &Handle) -> io::Result<()> {
-        debug_assert!(self.table_stack.is_empty(), "nested tables not supported");
-        self.ensure_blank_line()?;
+        if self.table_stack.is_empty() {
+            // Only emit a leading blank line for a top-level table. Nested
+            // tables are captured into their parent cell's redirect buffer.
+            self.ensure_blank_line()?;
+        }
         self.table_stack.push(TableState {
             rows: Vec::new(),
             current_row: Vec::new(),
-            current_cell: Vec::new(),
             in_header: false,
             current_row_has_th: false,
         });
@@ -481,32 +494,31 @@ impl<'a, W: Write> Converter<'a, W> {
 
     fn handle_cell(&mut self, is_th: bool, handle: &Handle) -> io::Result<()> {
         debug_assert!(!self.table_stack.is_empty(), "cell must be child of table");
+        // Capture the cell's rendered content through the redirect mechanism so
+        // that block children (lists, nested tables, etc.) are converted
+        // normally, then flattened to a single Markdown line by normalize_cell.
+        self.enter_redirect();
         self.walk_children(handle)?;
+        let Some(state) = self.leave_redirect() else {
+            return Ok(());
+        };
+        let cell_text = String::from_utf8(state.buf).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "invalid UTF-8 in table cell")
+        })?;
         if let Some(table) = self.table_stack.last_mut() {
             if is_th {
                 table.current_row_has_th = true;
             }
-            let raw = std::mem::take(&mut table.current_cell);
-            let mut cell_text = String::from_utf8(raw).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidData, "invalid UTF-8 in table cell")
-            })?;
-            let trimmed = cell_text.trim();
-            if trimmed.len() < cell_text.len() {
-                cell_text = trimmed.to_owned();
-            }
-            table.current_row.push(cell_text);
+            table.current_row.push(normalize_cell(&cell_text));
         }
         Ok(())
     }
 
     fn finish_table(&mut self) -> io::Result<()> {
         self.pending_space = false;
-        let table = match self.table_stack.pop() {
-            Some(t) => t,
-            None => {
-                debug_assert!(false, "finish_table called with empty stack");
-                return Ok(());
-            }
+        let Some(table) = self.table_stack.pop() else {
+            debug_assert!(false, "finish_table called with empty stack");
+            return Ok(());
         };
         if table.rows.is_empty() {
             return Ok(());
@@ -532,32 +544,41 @@ impl<'a, W: Write> Converter<'a, W> {
             widths.len() >= ncols,
             "widths array must have at least ncols elements"
         );
-        self.emit("|")?;
+        self.row_buf.clear();
+        self.row_buf.push('|');
         for (i, width) in widths.iter().enumerate().take(ncols) {
-            self.emit(" ")?;
-            let cell = row.cells.get(i).map(String::as_str).unwrap_or("");
-            if !cell.is_empty() {
-                self.emit(cell)?;
+            self.row_buf.push(' ');
+            let cell = row.cells.get(i).map_or("", String::as_str);
+            self.row_buf.push_str(cell);
+            let cell_width = UnicodeWidthStr::width(cell);
+            for _ in 0..width.saturating_sub(cell_width) {
+                self.row_buf.push(' ');
             }
-            for _ in 0..width.saturating_sub(cell.len()) {
-                self.emit(" ")?;
-            }
-            self.emit(" |")?;
+            self.row_buf.push_str(" |");
         }
-        self.emit("\n")
+        self.row_buf.push('\n');
+        let line = std::mem::take(&mut self.row_buf);
+        self.emit(&line)?;
+        self.row_buf = line;
+        Ok(())
     }
 
     fn emit_sep(&mut self, widths: &[usize], ncols: usize) -> io::Result<()> {
         debug_assert!(!widths.is_empty(), "widths array must not be empty");
-        self.emit("|")?;
+        self.row_buf.clear();
+        self.row_buf.push('|');
         for width in widths.iter().take(ncols) {
-            self.emit(" ")?;
+            self.row_buf.push(' ');
             for _ in 0..*width {
-                self.emit("-")?;
+                self.row_buf.push('-');
             }
-            self.emit(" |")?;
+            self.row_buf.push_str(" |");
         }
-        self.emit("\n")
+        self.row_buf.push('\n');
+        let line = std::mem::take(&mut self.row_buf);
+        self.emit(&line)?;
+        self.row_buf = line;
+        Ok(())
     }
 
     // Inline elements
@@ -568,15 +589,35 @@ impl<'a, W: Write> Converter<'a, W> {
             "*" => "_",
             _ => marker,
         };
-        let mut text = String::new();
-        collect_text_recursive(handle, &mut text, self.depth).map_err(io::Error::other)?;
-        let chosen = if text.contains(marker) && marker != alt && !text.contains(alt) {
+        // Capture the rendered content once via the redirect mechanism (already
+        // escaped/normalized), then pick the delimiter by scanning the buffer.
+        // This walks the subtree a single time instead of once to select a
+        // delimiter and again to emit.
+        self.enter_redirect();
+        self.walk_children(handle)?;
+        let Some(state) = self.leave_redirect() else {
+            return Ok(());
+        };
+        let buf = state.buf;
+        if buf.is_empty() {
+            // An empty inline element contributes nothing.
+            return Ok(());
+        }
+        // Choose the alternative delimiter only when a bare marker run appears
+        // in the rendered content (structural markers from nested formatting)
+        // and the alternative itself does not appear.
+        let marker_bytes = marker.as_bytes();
+        let alt_bytes = alt.as_bytes();
+        let chosen = if marker != alt
+            && slice_contains(&buf, marker_bytes)
+            && !slice_contains(&buf, alt_bytes)
+        {
             alt
         } else {
             marker
         };
         self.emit(chosen)?;
-        self.walk_children(handle)?;
+        self.raw_write(&buf)?;
         self.emit(chosen)
     }
 
@@ -585,7 +626,7 @@ impl<'a, W: Write> Converter<'a, W> {
             return self.walk_children(handle);
         }
         self.code_buf.clear();
-        collect_text_recursive(handle, &mut self.code_buf, self.depth).map_err(io::Error::other)?;
+        collect_text_recursive(handle, &mut self.code_buf, self.depth)?;
         let buf = std::mem::take(&mut self.code_buf);
 
         // Determine the minimum number of backticks needed for delimiters.
@@ -635,13 +676,7 @@ impl<'a, W: Write> Converter<'a, W> {
         self.walk_children(handle)?;
         self.emit("](")?;
         if let Some(ref h) = href {
-            if h.contains('(') || h.contains(')') || h.contains(' ') {
-                self.emit("<")?;
-                self.emit(h)?;
-                self.emit(">")?;
-            } else {
-                self.emit(h)?;
-            }
+            self.emit_url(h)?;
         }
         self.emit(")")
     }
@@ -656,13 +691,7 @@ impl<'a, W: Write> Converter<'a, W> {
         }
         self.emit("](")?;
         if let Some(s) = src {
-            if s.value.contains('(') || s.value.contains(')') || s.value.contains(' ') {
-                self.emit("<")?;
-                self.emit(&s.value)?;
-                self.emit(">")?;
-            } else {
-                self.emit(&s.value)?;
-            }
+            self.emit_url(&s.value)?;
         }
         self.emit(")")
     }
@@ -677,8 +706,6 @@ impl<'a, W: Write> Converter<'a, W> {
         }
         if let Some(state) = self.redirect_stack.last_mut() {
             state.buf.extend_from_slice(data);
-        } else if let Some(table) = self.table_stack.last_mut() {
-            table.current_cell.extend_from_slice(data);
         } else {
             self.out.write_all(data)?;
         }
@@ -703,7 +730,10 @@ impl<'a, W: Write> Converter<'a, W> {
             if to_write > 0 {
                 self.write_all(&bytes[..to_write])?;
             }
-            self.trailing_nls = (self.trailing_nls + to_write as u8).min(2);
+            // `to_write` is bounded by `needed` (<= 2), so it always fits in a
+            // u8; the fallback is never used.
+            let added = u8::try_from(to_write).unwrap_or(2);
+            self.trailing_nls = (self.trailing_nls + added).min(2);
             self.at_line_start = true;
             return Ok(());
         }
@@ -733,8 +763,6 @@ impl<'a, W: Write> Converter<'a, W> {
     fn write_one(&mut self, b: u8) -> io::Result<()> {
         if let Some(state) = self.redirect_stack.last_mut() {
             state.buf.push(b);
-        } else if let Some(table) = self.table_stack.last_mut() {
-            table.current_cell.push(b);
         } else {
             let buf = [b];
             self.out.write_all(&buf)?;
@@ -745,8 +773,6 @@ impl<'a, W: Write> Converter<'a, W> {
     fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
         if let Some(state) = self.redirect_stack.last_mut() {
             state.buf.extend_from_slice(data);
-        } else if let Some(table) = self.table_stack.last_mut() {
-            table.current_cell.extend_from_slice(data);
         } else {
             self.out.write_all(data)?;
         }
@@ -770,6 +796,31 @@ impl<'a, W: Write> Converter<'a, W> {
         self.write_all(&buf[pos..])
     }
 
+    /// Emit a link/image destination URL, wrapping it in angle brackets and
+    /// backslash-escaping `<`, `>` and backticks inside when the URL contains
+    /// characters that would otherwise break inline link syntax.
+    fn emit_url(&mut self, url: &str) -> io::Result<()> {
+        let needs_wrap = url
+            .chars()
+            .any(|c| matches!(c, '(' | ')' | '<' | '>' | '`') || c.is_whitespace());
+        if !needs_wrap {
+            return self.emit(url);
+        }
+        self.text_buf.clear();
+        self.text_buf.push('<');
+        for c in url.chars() {
+            if matches!(c, '<' | '>' | '`') {
+                self.text_buf.push('\\');
+            }
+            self.text_buf.push(c);
+        }
+        self.text_buf.push('>');
+        let buf = std::mem::take(&mut self.text_buf);
+        self.emit(&buf)?;
+        self.text_buf = buf;
+        Ok(())
+    }
+
     fn emit_text(&mut self, text: &str) -> io::Result<()> {
         if self.in_pre {
             if !text.is_empty() {
@@ -790,25 +841,32 @@ impl<'a, W: Write> Converter<'a, W> {
         } else {
             text
         };
+        // Coalesce the whole normalized node into a reusable buffer and emit
+        // it once, escaping Markdown-significant characters as we go. The
+        // first emitted character may sit at the start of an output line, in
+        // which case the line-start trigger characters (# + - >) are escaped
+        // too so they are not reinterpreted as block syntax.
+        self.text_buf.clear();
+        let mut first_on_line = self.at_line_start;
         let mut last_ws = false;
-        let mut seg_start = 0;
-        for (i, ch) in text.char_indices() {
+        for ch in text.chars() {
             if ch.is_whitespace() {
-                if !last_ws && seg_start < i {
-                    self.emit(&text[seg_start..i])?;
-                }
                 last_ws = true;
-                seg_start = i + ch.len_utf8();
             } else {
-                if last_ws && seg_start <= i {
-                    self.emit(" ")?;
+                if last_ws {
+                    self.text_buf.push(' ');
+                    first_on_line = false;
                 }
+                escape_markdown_char(&mut self.text_buf, ch, first_on_line);
                 last_ws = false;
+                first_on_line = false;
             }
         }
-        if seg_start < text.len() && !last_ws {
-            self.emit(&text[seg_start..])?;
+        let buf = std::mem::take(&mut self.text_buf);
+        if !buf.is_empty() {
+            self.emit(&buf)?;
         }
+        self.text_buf = buf;
         if last_ws {
             self.pending_space = true;
         }
@@ -828,28 +886,32 @@ impl<'a, W: Write> Converter<'a, W> {
         self.at_line_start = true;
         Ok(())
     }
+}
 
-    fn extract_code_language(&self, handle: &Handle) -> Option<String> {
-        for child in iter_children(handle) {
-            if let NodeData::Element { name, attrs, .. } = &child.data
-                && &*name.local == "code"
-            {
-                for attr in attrs.borrow().iter() {
-                    if &*attr.name.local == "class"
-                        && let Some(lang) = attr.value.strip_prefix("language-")
-                    {
-                        return Some(lang.to_owned());
-                    }
+/// Look for a `<code class="language-*">` child of `handle` and return the
+/// language tag for a fenced code block.
+fn extract_code_language(handle: &Handle) -> Option<String> {
+    for child in iter_children(handle) {
+        if let NodeData::Element { name, attrs, .. } = &child.data
+            && &*name.local == "code"
+        {
+            for attr in attrs.borrow().iter() {
+                if &*attr.name.local == "class"
+                    && let Some(lang) = attr.value.strip_prefix("language-")
+                {
+                    return Some(lang.to_owned());
                 }
             }
         }
-        None
     }
+    None
 }
 
-fn collect_text_recursive(handle: &Handle, out: &mut String, depth: u32) -> Result<(), String> {
+fn collect_text_recursive(handle: &Handle, out: &mut String, depth: u32) -> io::Result<()> {
     if depth > MAX_DEPTH {
-        return Err("text collection exceeds maximum depth".to_owned());
+        return Err(io::Error::other(format!(
+            "HTML nesting exceeds maximum depth of {MAX_DEPTH}"
+        )));
     }
     match &handle.data {
         NodeData::Text { contents } => {
@@ -863,6 +925,33 @@ fn collect_text_recursive(handle: &Handle, out: &mut String, depth: u32) -> Resu
         _ => {}
     }
     Ok(())
+}
+
+/// Returns `true` when `needle` occurs anywhere in `haystack`. A byte-level
+/// substring search is used because the captured content may be inspected
+/// before it is known to be valid UTF-8.
+fn slice_contains(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Escape a single character for Markdown output, appending it (and any
+/// required leading backslash) to `out`.
+///
+/// `at_line_start` indicates the character will be the first non-whitespace
+/// character on its output line, so block-triggering characters (`#`, `+`,
+/// `-`, `>`) are escaped as well. `<` is always escaped because a following
+/// tag-like sequence would otherwise be consumed as inline HTML. Strikethrough
+/// is supported, so `~` is always escaped.
+fn escape_markdown_char(out: &mut String, ch: char, at_line_start: bool) {
+    let needs_escape = matches!(ch, '\\' | '`' | '*' | '_' | '[' | ']' | '<' | '~')
+        || (at_line_start && matches!(ch, '#' | '+' | '-' | '>'));
+    if needs_escape {
+        out.push('\\');
+    }
+    out.push(ch);
 }
 
 /// Returns the length of the longest run of consecutive backtick characters
@@ -883,7 +972,7 @@ fn longest_backtick_run(s: &str) -> usize {
     max_run
 }
 
-/// Compute the maximum width of each column in a table.
+/// Compute the maximum display width of each column in a table.
 /// Results are written to `widths`, which is cleared and resized to `ncols`.
 fn compute_col_widths(rows: &[TableRow], ncols: usize, widths: &mut Vec<usize>) {
     widths.clear();
@@ -891,8 +980,33 @@ fn compute_col_widths(rows: &[TableRow], ncols: usize, widths: &mut Vec<usize>) 
     for row in rows {
         for (i, cell) in row.cells.iter().enumerate() {
             if i < ncols {
-                widths[i] = widths[i].max(cell.len());
+                let w = UnicodeWidthStr::width(cell.as_str());
+                widths[i] = widths[i].max(w);
             }
         }
     }
+}
+
+/// Collapse a table cell's rendered content to a single Markdown line: drop
+/// leading/trailing whitespace, reduce internal whitespace runs (including
+/// newlines produced by block children) to single spaces, and backslash-escape
+/// `|` so the cell cannot break out of its column.
+fn normalize_cell(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut pending_space = false;
+    for c in raw.chars() {
+        if c.is_whitespace() {
+            pending_space = true;
+            continue;
+        }
+        if pending_space && !out.is_empty() {
+            out.push(' ');
+        }
+        pending_space = false;
+        if c == '|' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
