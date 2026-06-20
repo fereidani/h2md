@@ -16,10 +16,10 @@ fn main() {
 
     let mut out = Vec::new();
     let result = convert(html.as_bytes(), &mut out);
-    println!("Result: {:?}", result);
+    println!("Result: {result:?}");
     if result.is_ok() {
         println!("Output length: {}", out.len());
         let md = String::from_utf8_lossy(&out);
-        println!("Output: {}", md);
+        println!("Output: {md}");
     }
 }

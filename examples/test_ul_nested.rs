@@ -17,8 +17,8 @@ fn main() {
 
     let mut out = Vec::new();
     let result = convert(html.as_bytes(), &mut out);
-    println!("Result: {:?}", result);
+    println!("Result: {result:?}");
     if let Err(e) = &result {
-        println!("Error: {}", e);
+        println!("Error: {e}");
     }
 }
