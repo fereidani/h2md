@@ -21,29 +21,25 @@ struct Cli {
 fn main() -> Result<(), h2md::Error> {
     let cli = Cli::parse();
 
-    let html: Vec<u8> = match cli.input {
-        Some(ref path) => fs::read(path)?,
-        None => {
-            let mut buf = Vec::new();
-            io::stdin().read_to_end(&mut buf)?;
-            buf
-        }
+    let html: Vec<u8> = if let Some(ref path) = cli.input {
+        fs::read(path)?
+    } else {
+        let mut buf = Vec::new();
+        io::stdin().read_to_end(&mut buf)?;
+        buf
     };
 
     if html.is_empty() {
         return Ok(());
     }
 
-    match cli.output {
-        Some(ref path) => {
-            let mut file = fs::File::create(path)?;
-            h2md::convert(&html, &mut file)?;
-        }
-        None => {
-            let stdout = io::stdout();
-            let mut handle = stdout.lock();
-            h2md::convert(&html, &mut handle)?;
-        }
+    if let Some(ref path) = cli.output {
+        let mut file = fs::File::create(path)?;
+        h2md::convert(&html, &mut file)?;
+    } else {
+        let stdout = io::stdout();
+        let mut handle = stdout.lock();
+        h2md::convert(&html, &mut handle)?;
     }
 
     Ok(())
