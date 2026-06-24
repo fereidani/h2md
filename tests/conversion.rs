@@ -1,9 +1,21 @@
-use h2md::convert;
+use h2md::{Options, convert, convert_with};
 
 /// Helper: convert HTML to Markdown, trimming surrounding whitespace.
 fn h(input: &str) -> String {
     let mut out = Vec::new();
     convert(input.as_bytes(), &mut out).expect("conversion failed");
+    String::from_utf8(out)
+        .expect("output was not valid UTF-8")
+        .trim()
+        .to_owned()
+}
+
+/// Helper: convert HTML to Markdown in compressed mode, trimming surrounding
+/// whitespace.
+fn hc(input: &str) -> String {
+    let mut out = Vec::new();
+    convert_with(input.as_bytes(), &mut out, &Options { compressed: true })
+        .expect("conversion failed");
     String::from_utf8(out)
         .expect("output was not valid UTF-8")
         .trim()
@@ -812,4 +824,101 @@ fn list_inside_table_cell_is_single_line() {
         row.starts_with('|') && row.ends_with('|'),
         "list-in-cell stays on one table row: {row:?}"
     );
+}
+
+// Compressed (`-c`) tables
+
+#[test]
+fn compressed_table_minimal_definition() {
+    let md = hc("<table>\
+         <tr><th>Name</th><th>Age</th></tr>\
+         <tr><td>Alice</td><td>30</td></tr>\
+         <tr><td>Bob</td><td>25</td></tr>\
+         </table>");
+    assert!(md.contains("|Name|Age|"), "compact header: {md:?}");
+    assert!(md.contains("|-|-|"), "minimal separator: {md:?}");
+    assert!(md.contains("|Alice|30|"), "compact data row 1: {md:?}");
+    assert!(md.contains("|Bob|25|"), "compact data row 2: {md:?}");
+    assert!(
+        !md.contains("| Name"),
+        "no padding spaces in compressed mode: {md:?}"
+    );
+}
+
+#[test]
+fn compressed_table_without_explicit_headers() {
+    let md = hc("<table>\
+         <tr><td>A</td><td>B</td></tr>\
+         <tr><td>C</td><td>D</td></tr>\
+         </table>");
+    assert!(md.contains("|A|B|"), "compact row 1: {md:?}");
+    assert!(md.contains("|C|D|"), "compact row 2: {md:?}");
+    // A separator is still required after the first row for a valid table.
+    assert!(md.contains("|-|-|"), "separator after first row: {md:?}");
+}
+
+#[test]
+fn compressed_table_ragged_rows() {
+    let md = hc("<table>\
+         <tr><td>A</td><td>B</td><td>C</td></tr>\
+         <tr><td>D</td></tr>\
+         </table>");
+    assert!(md.contains("|A|B|C|"), "full row: {md:?}");
+    assert!(
+        md.contains("|D||"),
+        "ragged row padded with empty cell: {md:?}"
+    );
+}
+
+#[test]
+fn normal_table_unaffected_by_compressed_option() {
+    // Default options still produce the aligned, padded table.
+    let md = h("<table>\
+         <tr><th>Name</th><th>Age</th></tr>\
+         <tr><td>Alice</td><td>30</td></tr>\
+         </table>");
+    assert!(md.contains("| Name  | Age |"), "aligned header: {md:?}");
+    assert!(md.contains("| ----- | --- |"), "aligned separator: {md:?}");
+}
+
+// List items whose first child is a block element must not leave the marker
+// alone on its own line with a leading blank line (regression: nav menus built
+// from <div> dropdowns used to fragment into many short lines).
+
+#[test]
+fn list_item_with_div_first_child_no_empty_marker() {
+    let md = h("<ul><li><div>x</div></li></ul>");
+    assert!(
+        md.contains("- x"),
+        "content follows marker directly: {md:?}"
+    );
+    assert!(!md.contains("- \n"), "no empty marker line: {md:?}");
+}
+
+#[test]
+fn list_item_with_paragraph_first_child() {
+    let md = h("<ul><li><p>text</p></li></ul>");
+    assert!(
+        md.contains("- text"),
+        "paragraph inline with marker: {md:?}"
+    );
+    assert!(!md.contains("- \n\n"), "no blank line after marker: {md:?}");
+}
+
+#[test]
+fn nav_like_dropdown_list_does_not_fragment() {
+    // Mirrors the CWE navigation: a <li> whose first child is a <div> wrapping
+    // a label button and a container of links.
+    let md = h("<ul><li>\
+         <div class=\"dropdown\"><button>Section</button>\
+         <div class=\"dropdown-content\">\
+         <a href=\"/a\">Link A</a> <a href=\"/b\">Link B</a>\
+         </div></div>\
+         </li></ul>");
+    assert!(
+        md.contains("- Section"),
+        "label directly after marker (no double space): {md:?}"
+    );
+    assert!(!md.contains("- \n"), "no empty marker: {md:?}");
+    assert!(md.contains("[Link A](/a)"), "links preserved: {md:?}");
 }

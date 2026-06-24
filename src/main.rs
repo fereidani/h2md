@@ -16,6 +16,10 @@ struct Cli {
     /// Output file (writes to stdout if not provided)
     #[arg(short = 'o')]
     output: Option<String>,
+    /// Compressed output: emit minimal, unpadded Markdown tables.
+    /// Saves tokens; use this when feeding output to agents or LLMs.
+    #[arg(short = 'c', long = "compress")]
+    compressed: bool,
 }
 
 fn main() -> Result<(), h2md::Error> {
@@ -33,13 +37,17 @@ fn main() -> Result<(), h2md::Error> {
         return Ok(());
     }
 
+    let opts = h2md::Options {
+        compressed: cli.compressed,
+    };
+
     if let Some(ref path) = cli.output {
         let mut file = fs::File::create(path)?;
-        h2md::convert(&html, &mut file)?;
+        h2md::convert_with(&html, &mut file, &opts)?;
     } else {
         let stdout = io::stdout();
         let mut handle = stdout.lock();
-        h2md::convert(&html, &mut handle)?;
+        h2md::convert_with(&html, &mut handle, &opts)?;
     }
 
     Ok(())

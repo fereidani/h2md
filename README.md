@@ -53,6 +53,9 @@ curl -s https://example.com | h2md
 
 # pipe into other tools
 h2md page.html | wc -l
+
+# compressed output: minimal, unpadded tables
+h2md -c page.html
 ```
 
 ### Library
@@ -88,7 +91,32 @@ convert(html, &mut file)?;
 
 Parse HTML and write Markdown directly to a `Write` target. The output ends
 with a trailing newline. Returns an error if the HTML cannot be parsed or if
-writing fails.
+writing fails. Uses the default [`Options`](#options).
+
+### `convert_with(html: &[u8], out: &mut impl Write, opts: &Options) -> Result<(), Error>`
+
+Like [`convert`](#converthtml-u8-out-mut-impl-write--result-error), but accepts
+an [`Options`](#options) value. Use this to enable compressed table output from
+the library:
+
+```rust
+use h2md::{Options, convert_with};
+
+let html = b"<table><tr><th>A</th><th>B</th></tr><tr><td>1</td><td>2</td></tr></table>";
+let mut out = Vec::new();
+convert_with(html, &mut out, &Options { compressed: true })?;
+// out contains the minimal table: |A|B| / |-|-| / |1|2|
+# Ok::<(), h2md::Error>(())
+```
+
+### `Options`
+
+Controls Markdown output. Construct with `Options::default()` for standard
+output.
+
+| Field        | Default | Description                                             |
+| ------------ | ------- | ------------------------------------------------------- |
+| `compressed` | `false` | Emit compact, unpadded Markdown tables (`\|a\|b\|` form) |
 
 ### `Error`
 

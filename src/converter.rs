@@ -64,20 +64,43 @@ impl From<io::Error> for Error {
     }
 }
 
-/// Convert HTML to Markdown, writing directly to any [`Write`] target.
+/// Options that control Markdown output. Construct with [`Options::default`]
+/// for standard output, or toggle fields for a more compact result.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Options {
+    /// Emit compact, unpadded Markdown tables with a minimal separator row.
+    /// When false (the default), tables are aligned with column padding.
+    pub compressed: bool,
+}
+
+/// Convert HTML to Markdown with the default [`Options`], writing directly to
+/// any [`Write`] target.
 ///
 /// # Errors
 ///
 /// Returns [`Error::Parse`] if the HTML input cannot be parsed.
 /// Returns [`Error::Io`] if writing to the output fails.
 pub fn convert<W: Write>(html: &[u8], out: &mut W) -> Result<(), Error> {
+    convert_with(html, out, &Options::default())
+}
+
+/// Convert HTML to Markdown using `opts`, writing directly to any [`Write`]
+/// target.
+///
+/// # Errors
+///
+/// Returns [`Error::Parse`] if the HTML input cannot be parsed.
+/// Returns [`Error::Io`] if writing to the output fails.
+pub fn convert_with<W: Write>(html: &[u8], out: &mut W, opts: &Options) -> Result<(), Error> {
     debug_assert!(!html.is_empty(), "input html must not be empty");
     let dom = RcDom::parse(html)?;
     let mut cvt = Converter {
         out,
+        compressed: opts.compressed,
         redirect_stack: Vec::new(),
         in_pre: false,
         at_line_start: true,
+        at_item_start: false,
         pending_space: false,
         trailing_nls: 0,
         list_stack: Vec::new(),
@@ -134,15 +157,24 @@ fn list_indent_str(level: usize) -> &'static str {
 struct RedirectState {
     buf: Vec<u8>,
     saved_at_line_start: bool,
+    saved_at_item_start: bool,
     saved_pending_space: bool,
     saved_trailing_nls: u8,
 }
 
+// The independent boolean flags below track distinct facets of the output
+// position; a state enum would not model them cleanly, so the bool count is
+// accepted here.
+#[allow(clippy::struct_excessive_bools)]
 struct Converter<'a, W: Write> {
     out: &'a mut W,
+    compressed: bool,
     redirect_stack: Vec<RedirectState>,
     in_pre: bool,
     at_line_start: bool,
+    /// True while a list item has emitted its marker but no body content yet,
+    /// so a leading block child does not insert a blank line after the marker.
+    at_item_start: bool,
     pending_space: bool,
     trailing_nls: u8,
     list_stack: Vec<ListInfo>,
@@ -186,10 +218,12 @@ impl<W: Write> Converter<'_, W> {
         self.redirect_stack.push(RedirectState {
             buf: Vec::new(),
             saved_at_line_start: self.at_line_start,
+            saved_at_item_start: self.at_item_start,
             saved_pending_space: self.pending_space,
             saved_trailing_nls: self.trailing_nls,
         });
         self.at_line_start = true;
+        self.at_item_start = false;
         self.pending_space = false;
         self.trailing_nls = 0;
     }
@@ -201,6 +235,7 @@ impl<W: Write> Converter<'_, W> {
         );
         let state = self.redirect_stack.pop()?;
         self.at_line_start = state.saved_at_line_start;
+        self.at_item_start = state.saved_at_item_start;
         self.pending_space = state.saved_pending_space;
         self.trailing_nls = state.saved_trailing_nls;
         Some(state)
@@ -437,6 +472,10 @@ impl<W: Write> Converter<'_, W> {
             self.emit("- ")?;
         }
         self.at_line_start = false;
+        // The item has emitted its marker but no body content yet; the first
+        // block child must not prepend a blank line that would leave the
+        // marker alone on its own line.
+        self.at_item_start = true;
         self.walk_children(handle)?;
         self.emit("\n")?;
         self.at_line_start = true;
@@ -525,17 +564,58 @@ impl<W: Write> Converter<'_, W> {
         }
         let ncols = table.rows.iter().map(|r| r.cells.len()).max().unwrap_or(0);
         debug_assert!(ncols > 0, "table must have columns");
-        let mut widths = Vec::new();
-        compute_col_widths(&table.rows, ncols, &mut widths);
         let has_explicit = table.rows.iter().any(|r| r.is_header);
-        for (idx, row) in table.rows.iter().enumerate() {
-            self.emit_row(row, &widths, ncols)?;
-            if row.is_header || (!has_explicit && idx == 0) {
-                self.emit_sep(&widths, ncols)?;
+        if self.compressed {
+            for (idx, row) in table.rows.iter().enumerate() {
+                self.emit_compact_row(row, ncols)?;
+                if row.is_header || (!has_explicit && idx == 0) {
+                    self.emit_compact_sep(ncols)?;
+                }
+            }
+        } else {
+            let mut widths = Vec::new();
+            compute_col_widths(&table.rows, ncols, &mut widths);
+            for (idx, row) in table.rows.iter().enumerate() {
+                self.emit_row(row, &widths, ncols)?;
+                if row.is_header || (!has_explicit && idx == 0) {
+                    self.emit_sep(&widths, ncols)?;
+                }
             }
         }
         self.emit("\n")?;
         self.at_line_start = true;
+        Ok(())
+    }
+
+    /// Emit a single table row with no alignment padding: `|a|b|`. Empty cells
+    /// become `||`. Used in compressed mode.
+    fn emit_compact_row(&mut self, row: &TableRow, ncols: usize) -> io::Result<()> {
+        self.row_buf.clear();
+        for i in 0..ncols {
+            self.row_buf.push('|');
+            let cell = row.cells.get(i).map_or("", String::as_str);
+            self.row_buf.push_str(cell);
+        }
+        self.row_buf.push('|');
+        self.row_buf.push('\n');
+        let line = std::mem::take(&mut self.row_buf);
+        self.emit(&line)?;
+        self.row_buf = line;
+        Ok(())
+    }
+
+    /// Emit a minimal separator row with one dash per column: `|-|-|`.
+    fn emit_compact_sep(&mut self, ncols: usize) -> io::Result<()> {
+        self.row_buf.clear();
+        for _ in 0..ncols {
+            self.row_buf.push('|');
+            self.row_buf.push('-');
+        }
+        self.row_buf.push('|');
+        self.row_buf.push('\n');
+        let line = std::mem::take(&mut self.row_buf);
+        self.emit(&line)?;
+        self.row_buf = line;
         Ok(())
     }
 
@@ -738,6 +818,11 @@ impl<W: Write> Converter<'_, W> {
             return Ok(());
         }
         self.write_all(bytes)?;
+        // Real (non-whitespace) content ends the "just emitted a marker" state
+        // where leading blank lines are suppressed.
+        if self.at_item_start && bytes.iter().any(|&b| !b.is_ascii_whitespace()) {
+            self.at_item_start = false;
+        }
         let len = bytes.len();
         let mut nls: u8 = 0;
         for &b in bytes.iter().rev().take(2) {
@@ -832,7 +917,7 @@ impl<W: Write> Converter<'_, W> {
     }
 
     fn emit_text_normalized(&mut self, text: &str) -> io::Result<()> {
-        let text = if self.at_line_start {
+        let text = if self.at_line_start || self.at_item_start {
             let trimmed = text.trim_start();
             if trimmed.is_empty() {
                 return Ok(());
@@ -876,6 +961,11 @@ impl<W: Write> Converter<'_, W> {
     fn ensure_blank_line(&mut self) -> io::Result<()> {
         self.pending_space = false;
         if self.table_stack.last().is_some() {
+            return Ok(());
+        }
+        // A block element that is the first body content of a list item must
+        // not insert a blank line after the marker.
+        if self.at_item_start {
             return Ok(());
         }
         match self.trailing_nls {

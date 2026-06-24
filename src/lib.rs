@@ -33,4 +33,4 @@
 mod converter;
 mod dom;
 
-pub use converter::{Error, convert};
+pub use converter::{Error, Options, convert, convert_with};
