@@ -352,12 +352,14 @@ impl<W: Write> Converter<'_, W> {
             "hr" => self.handle_hr(),
             "br" => self.handle_br(),
             "div" | "section" | "article" | "main" | "header" | "footer" | "nav" | "aside"
-            | "figure" | "figcaption" | "details" | "summary" | "address" => {
+            | "figure" | "figcaption" | "details" | "summary" | "address" | "dl" => {
                 self.ensure_blank_line()?;
                 self.walk_children(handle)
             }
             "ul" | "ol" => self.handle_list(tag == "ol", attrs, handle),
             "li" => self.handle_list_item(handle),
+            "dt" => self.handle_definition_term(handle),
+            "dd" => self.handle_definition_description(handle),
             "table" => self.handle_table(handle),
             "thead" => self.handle_thead(handle),
             "tr" => self.handle_tr(handle),
@@ -551,6 +553,25 @@ impl<W: Write> Converter<'_, W> {
         self.list_stack.len().saturating_sub(1) * 2
     }
 
+    // Definition lists
+    //
+    // Markdown has no definition list, so a `dl` renders as a sequence of
+    // lines: each term starts a new entry after a blank line and its
+    // descriptions follow on the lines directly below, which keeps a term
+    // bound to its own description.
+
+    fn handle_definition_term(&mut self, handle: &Handle) -> io::Result<()> {
+        self.ensure_blank_line()?;
+        self.walk_children(handle)?;
+        self.ensure_line_start()
+    }
+
+    fn handle_definition_description(&mut self, handle: &Handle) -> io::Result<()> {
+        self.ensure_line_start()?;
+        self.walk_children(handle)?;
+        self.ensure_line_start()
+    }
+
     // Tables
 
     fn handle_table(&mut self, handle: &Handle) -> io::Result<()> {
@@ -726,6 +747,10 @@ impl<W: Write> Converter<'_, W> {
     // Inline elements
 
     fn handle_inline(&mut self, marker: &str, handle: &Handle) -> io::Result<()> {
+        if self.in_pre {
+            // Inside a fenced code block the delimiters would be literal text.
+            return self.walk_children(handle);
+        }
         let alt = match marker {
             "**" => "__",
             "*" => "_",
@@ -814,11 +839,19 @@ impl<W: Write> Converter<'_, W> {
     }
 
     fn handle_link(&mut self, attrs: &RefCell<Vec<Attribute>>, handle: &Handle) -> io::Result<()> {
+        if self.in_pre {
+            // Inside a fenced code block link syntax would be literal text, so
+            // only the link's own text belongs in the block.
+            return self.walk_children(handle);
+        }
         let href = attrs
             .borrow()
             .iter()
             .find(|a| &*a.name.local == "href")
             .map(|a| a.value.clone());
+        if self.is_anchor_marker(href.as_deref(), handle)? {
+            return Ok(());
+        }
         self.emit("[")?;
         self.walk_inline_children(handle)?;
         self.emit("](")?;
@@ -832,6 +865,16 @@ impl<W: Write> Converter<'_, W> {
         let borrowed = attrs.borrow();
         let src = borrowed.iter().find(|a| &*a.name.local == "src");
         let alt = borrowed.iter().find(|a| &*a.name.local == "alt");
+        if self.in_pre {
+            // Inside a fenced code block image syntax would be literal text;
+            // the alt text is the only part that reads as code.
+            if let Some(a) = alt
+                && !a.value.is_empty()
+            {
+                self.emit(&a.value)?;
+            }
+            return Ok(());
+        }
         self.emit("![")?;
         if let Some(a) = alt {
             self.emit_alt(&a.value)?;
@@ -974,6 +1017,34 @@ impl<W: Write> Converter<'_, W> {
         self.write_all(&buf[pos..])
     }
 
+    /// Returns `true` when a link is a bare anchor marker: a same-page link
+    /// whose visible text is nothing but a section glyph.
+    ///
+    /// Documentation generators attach one of these to every heading as a
+    /// click target for copying the anchor: a section sign (U+00A7) in
+    /// rustdoc, a pilcrow (U+00B6) in Sphinx and similar generators, or a
+    /// plain `#`. The glyph carries no content, so the link is dropped.
+    fn is_anchor_marker(&mut self, href: Option<&str>, handle: &Handle) -> io::Result<bool> {
+        let Some(href) = href else {
+            return Ok(false);
+        };
+        if !href.starts_with('#') {
+            return Ok(false);
+        }
+        // `code_buf` is only live inside `handle_code`, which cannot be running
+        // here, so it doubles as the scratch buffer for the link's text.
+        let mut buf = std::mem::take(&mut self.code_buf);
+        buf.clear();
+        let collected = collect_text_recursive(handle, &mut buf, self.depth);
+        let text = buf.trim();
+        let is_marker = collected.is_ok()
+            && !text.is_empty()
+            && text.chars().all(|c| matches!(c, '\u{a7}' | '\u{b6}' | '#'));
+        self.code_buf = buf;
+        collected?;
+        Ok(is_marker)
+    }
+
     /// Emit an image's alt text. In compressed mode whitespace runs collapse to
     /// a single space so the `![...]` label stays on one line; an attribute
     /// value may hold newlines of its own.
@@ -1103,6 +1174,19 @@ impl<W: Write> Converter<'_, W> {
             0 => self.emit("\n\n")?,
             1 => self.emit("\n")?,
             _ => {}
+        }
+        self.at_line_start = true;
+        Ok(())
+    }
+
+    /// Move to the start of a line without inserting a blank one.
+    fn ensure_line_start(&mut self) -> io::Result<()> {
+        self.pending_space = false;
+        if self.table_stack.last().is_some() {
+            return Ok(());
+        }
+        if self.trailing_nls == 0 {
+            self.emit("\n")?;
         }
         self.at_line_start = true;
         Ok(())

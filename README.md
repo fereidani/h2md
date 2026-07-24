@@ -20,11 +20,15 @@ the [Servo] browser project.
   no intermediate string construction
 - **CLI and library**: Use as a command-line tool or as a Rust library
 - **Comprehensive element support**: Headings, paragraphs, inline formatting,
-  links, images, lists (with nesting), blockquotes, code blocks, tables,
-  horizontal rules
+  links, images, lists (with nesting), definition lists, blockquotes, code
+  blocks, tables, horizontal rules
 - **Correct edge-case handling**: Proper backtick escaping in code spans,
   alternative delimiter selection, angle-bracket wrapping for URLs with spaces
   or parentheses, `ol start` attribute support
+- **Documentation-friendly**: Inline elements inside `<pre>` contribute text
+  only, so linked type names in a generated API signature stay valid code, and
+  bare heading anchor markers (the section sign, pilcrow, or `#` glyph that
+  documentation generators attach to every heading) are dropped
 - **Safe against malicious input**: Recursion depth bounded to 200 levels to
   prevent stack overflow on deeply nested HTML
 

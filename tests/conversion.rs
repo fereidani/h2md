@@ -1037,3 +1037,99 @@ fn normal_mode_padding_unaffected_by_compressed_changes() {
         "loose list preserved: {list:?}"
     );
 }
+
+// Markdown syntax is literal text inside a fenced code block, so inline
+// elements inside <pre> contribute their text and nothing else (regression:
+// rustdoc links every type in a signature).
+
+#[test]
+fn link_inside_pre_emits_text_only() {
+    let md = h("<pre><code>fn f(x: <a href=\"/std/u8.html\">u8</a>)</code></pre>");
+    assert_eq!(md, "```\nfn f(x: u8)\n```");
+}
+
+#[test]
+fn emphasis_inside_pre_emits_text_only() {
+    let md = h("<pre><strong>bold</strong> and <em>it</em></pre>");
+    assert_eq!(md, "```\nbold and it\n```");
+}
+
+#[test]
+fn image_inside_pre_emits_alt_only() {
+    let md = h("<pre>a <img src=\"i.png\" alt=\"ALT\"> b</pre>");
+    assert_eq!(md, "```\na ALT b\n```");
+}
+
+#[test]
+fn link_inside_pre_is_not_escaped() {
+    // Text inside a code block keeps its Markdown-significant characters.
+    let md = h("<pre><a href=\"/x\">Vec&lt;u8&gt;</a></pre>");
+    assert_eq!(md, "```\nVec<u8>\n```");
+}
+
+// Definition lists
+
+#[test]
+fn definition_list() {
+    let md = h("<dl><dt>Term</dt><dd>Meaning</dd></dl>");
+    assert_eq!(md, "Term\nMeaning");
+}
+
+#[test]
+fn definition_list_entries_are_separated() {
+    let md = h("<dl><dt>A</dt><dd>first</dd><dt>B</dt><dd>second</dd></dl>");
+    assert_eq!(md, "A\nfirst\n\nB\nsecond");
+}
+
+#[test]
+fn definition_term_and_description_are_not_glued() {
+    // Regression: dl/dt/dd used to fall through to the generic element path,
+    // which ran the term straight into its description.
+    let md = hc("<dl><dt><a href=\"f.html\">convert</a></dt><dd>Convert HTML.</dd></dl>");
+    assert_eq!(md, "[convert](f.html)\nConvert HTML.");
+}
+
+#[test]
+fn definition_list_with_multiple_descriptions() {
+    let md = h("<dl><dt>Term</dt><dd>one</dd><dd>two</dd></dl>");
+    assert_eq!(md, "Term\none\ntwo");
+}
+
+// Heading anchor markers
+
+#[test]
+fn section_sign_anchor_marker_dropped() {
+    let md = h("<h2 id=\"f\">Fields<a href=\"#f\" class=\"anchor\">\u{a7}</a></h2>");
+    assert_eq!(md, "## Fields");
+}
+
+#[test]
+fn pilcrow_anchor_marker_dropped() {
+    let md = h("<h2 id=\"f\">Fields<a href=\"#f\">\u{b6}</a></h2>");
+    assert_eq!(md, "## Fields");
+}
+
+#[test]
+fn hash_anchor_marker_dropped() {
+    let md = h("<h2 id=\"f\">Fields<a href=\"#f\"> # </a></h2>");
+    assert_eq!(md, "## Fields");
+}
+
+#[test]
+fn same_page_link_with_text_kept() {
+    assert_eq!(h("<a href=\"#sec\">Section</a>"), "[Section](#sec)");
+}
+
+#[test]
+fn glyph_link_to_other_page_kept() {
+    // Only same-page links are anchor markers; elsewhere the glyph is content.
+    assert_eq!(h("<a href=\"/x\">\u{a7}</a>"), "[\u{a7}](/x)");
+}
+
+#[test]
+fn anchor_marker_with_surrounding_text_kept() {
+    assert_eq!(
+        h("<a href=\"#sec\">\u{a7} Section</a>"),
+        "[\u{a7} Section](#sec)"
+    );
+}

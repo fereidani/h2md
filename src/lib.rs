@@ -11,6 +11,7 @@
 //! - Inline formatting (bold, italic, strikethrough, code)
 //! - Links and images
 //! - Ordered and unordered lists (with nesting)
+//! - Definition lists
 //! - Blockquotes
 //! - Code blocks with language detection
 //! - Tables
