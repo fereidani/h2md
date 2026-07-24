@@ -29,6 +29,15 @@ fn h_raw(input: &str) -> String {
     String::from_utf8(out).expect("output was not valid UTF-8")
 }
 
+/// Helper: convert in compressed mode and return the raw output without
+/// trimming.
+fn hc_raw(input: &str) -> String {
+    let mut out = Vec::new();
+    convert_with(input.as_bytes(), &mut out, &Options { compressed: true })
+        .expect("conversion failed");
+    String::from_utf8(out).expect("output was not valid UTF-8")
+}
+
 // Headings
 
 #[test]
@@ -921,4 +930,110 @@ fn nav_like_dropdown_list_does_not_fragment() {
     );
     assert!(!md.contains("- \n"), "no empty marker: {md:?}");
     assert!(md.contains("[Link A](/a)"), "links preserved: {md:?}");
+}
+
+// Compressed (`-c`) padding: the output is a plain Markdown document with
+// minimal standard padding, so inline constructs never span lines and no run
+// of more than one blank line survives.
+
+#[test]
+fn compressed_link_with_block_children_stays_on_one_line() {
+    let raw = hc_raw("<a href=\"/x\"><div>Line A</div><p>Line B</p></a>");
+    assert_eq!(raw, "[Line A Line B](/x)\n");
+}
+
+#[test]
+fn compressed_link_text_has_no_newline() {
+    let raw = hc_raw("<a href=\"/x\"><h1>Head</h1><p>Body</p></a><p>after</p>");
+    let link_end = raw.find("](").expect("link destination missing");
+    assert!(
+        !raw[..link_end].contains('\n'),
+        "link text must not contain newlines: {raw:?}"
+    );
+}
+
+#[test]
+fn compressed_emphasis_with_block_child_stays_on_one_line() {
+    let raw = hc_raw("<strong><p>a</p><p>b</p></strong>");
+    assert_eq!(raw, "**a b**\n");
+}
+
+#[test]
+fn compressed_heading_with_block_children_stays_on_one_line() {
+    let raw = hc_raw("<h2><div>A</div><div>B</div></h2>");
+    assert_eq!(raw, "## A B\n");
+}
+
+#[test]
+fn compressed_image_alt_newlines_collapse() {
+    let raw = hc_raw("<img src=\"a.png\" alt=\"line1\nline2\">");
+    assert_eq!(raw, "![line1 line2](a.png)\n");
+}
+
+#[test]
+fn compressed_image_without_alt() {
+    let raw = hc_raw("<img src=\"a.png\" alt=\"\">");
+    assert_eq!(raw, "![](a.png)\n");
+}
+
+#[test]
+fn compressed_has_no_leading_or_trailing_blank_padding() {
+    let raw = hc_raw("<div><p>Hello</p></div>");
+    assert_eq!(raw, "Hello\n");
+}
+
+#[test]
+fn compressed_empty_document_writes_nothing() {
+    assert_eq!(hc_raw("<div></div>"), "");
+}
+
+#[test]
+fn compressed_blocks_separated_by_single_blank_line() {
+    let raw = hc_raw(
+        "<div><div><p>a</p></div></div>\
+         <blockquote><p>x</p></blockquote>\
+         <table><tr><td>c</td></tr></table>\
+         <p>z</p>",
+    );
+    assert!(
+        !raw.contains("\n\n\n"),
+        "at most one blank line between blocks: {raw:?}"
+    );
+    assert_eq!(raw, "a\n\n> x\n\n|c|\n|-|\n\nz\n");
+}
+
+#[test]
+fn compressed_list_is_tight() {
+    let raw = hc_raw("<ul><li><p>a</p></li><li><p>b</p></li></ul><p>end</p>");
+    assert_eq!(raw, "- a\n- b\n\nend\n");
+}
+
+#[test]
+fn compressed_nested_list_is_tight() {
+    let raw = hc_raw("<ul><li>a<ul><li>b</li></ul></li><li>c</li></ul>");
+    assert_eq!(raw, "- a\n  - b\n- c\n");
+}
+
+#[test]
+fn compressed_code_block_keeps_internal_blank_lines() {
+    let raw = hc_raw("<pre>a\n\n\n\nb</pre>");
+    assert_eq!(raw, "```\na\n\n\n\nb\n```\n");
+}
+
+#[test]
+fn compressed_consecutive_breaks_do_not_pad() {
+    let raw = hc_raw("<p>a<br><br>b</p>");
+    assert_eq!(raw, "a  \nb\n");
+}
+
+#[test]
+fn normal_mode_padding_unaffected_by_compressed_changes() {
+    // Default output keeps the surrounding blank lines and the loose list.
+    let raw = h_raw("<div><p>Hello</p></div>");
+    assert_eq!(raw, "\n\nHello\n\n");
+    let list = h_raw("<ul><li><p>a</p></li><li><p>b</p></li></ul>");
+    assert!(
+        list.contains("- a\n\n- b"),
+        "loose list preserved: {list:?}"
+    );
 }

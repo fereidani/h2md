@@ -16,7 +16,8 @@ struct Cli {
     /// Output file (writes to stdout if not provided)
     #[arg(short = 'o')]
     output: Option<String>,
-    /// Compressed output: emit minimal, unpadded Markdown tables.
+    /// Compressed output: minimal padding, unpadded tables, tight lists, and
+    /// single-line inline content.
     /// Saves tokens; use this when feeding output to agents or LLMs.
     #[arg(short = 'c', long = "compress")]
     compressed: bool,

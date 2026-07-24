@@ -54,7 +54,7 @@ curl -s https://example.com | h2md
 # pipe into other tools
 h2md page.html | wc -l
 
-# compressed output: minimal, unpadded tables
+# compressed output: minimal padding, unpadded tables
 h2md -c page.html
 ```
 
@@ -114,9 +114,21 @@ convert_with(html, &mut out, &Options { compressed: true })?;
 Controls Markdown output. Construct with `Options::default()` for standard
 output.
 
-| Field        | Default | Description                                             |
-| ------------ | ------- | ------------------------------------------------------- |
-| `compressed` | `false` | Emit compact, unpadded Markdown tables (`\|a\|b\|` form) |
+| Field        | Default | Description                                                 |
+| ------------ | ------- | ----------------------------------------------------------- |
+| `compressed` | `false` | Emit compact Markdown with minimal padding (see below)       |
+
+Compressed output differs from the default in four ways:
+
+- tables are unpadded with a minimal separator row (`|a|b|` / `|-|-|`),
+- inline content (link text, emphasis, headings, image alt text) is collapsed
+  onto a single line, so a block element inside a link can never split `[...]`
+  across lines,
+- lists stay tight, with no blank line between items,
+- blocks are separated by at most one blank line, and the document neither
+  starts nor ends with blank padding.
+
+Fenced code blocks are untouched: blank lines inside them are preserved.
 
 ### `Error`
 

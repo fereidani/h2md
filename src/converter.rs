@@ -68,8 +68,18 @@ impl From<io::Error> for Error {
 /// for standard output, or toggle fields for a more compact result.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Options {
-    /// Emit compact, unpadded Markdown tables with a minimal separator row.
-    /// When false (the default), tables are aligned with column padding.
+    /// Emit compact Markdown with minimal padding:
+    ///
+    /// - tables are unpadded with a minimal separator row (`|a|b|`),
+    /// - inline content (link text, emphasis, headings, image alt text) is
+    ///   collapsed onto a single line, so a block element inside a link can
+    ///   never split `[...]` across lines,
+    /// - lists stay tight, with no blank line between items,
+    /// - blocks are separated by at most one blank line, and the document
+    ///   neither starts nor ends with blank padding.
+    ///
+    /// When false (the default), tables are aligned with column padding and
+    /// blocks keep the surrounding blank lines.
     pub compressed: bool,
 }
 
@@ -103,6 +113,8 @@ pub fn convert_with<W: Write>(html: &[u8], out: &mut W, opts: &Options) -> Resul
         at_item_start: false,
         pending_space: false,
         trailing_nls: 0,
+        pending_nls: 0,
+        wrote_any: false,
         list_stack: Vec::new(),
         table_stack: Vec::new(),
         code_buf: String::new(),
@@ -117,6 +129,10 @@ pub fn convert_with<W: Write>(html: &[u8], out: &mut W, opts: &Options) -> Resul
 
 /// Maximum recursion depth to prevent stack overflow on malicious HTML.
 const MAX_DEPTH: u32 = 200;
+
+/// Maximum run of consecutive newlines in the output: one blank line between
+/// blocks.
+const MAX_BLANK_NLS: u8 = 2;
 
 /// Markdown heading prefixes indexed by heading level (1-6); index 0 unused.
 const HASHES: [&str; 7] = ["", "#", "##", "###", "####", "#####", "######"];
@@ -177,6 +193,14 @@ struct Converter<'a, W: Write> {
     at_item_start: bool,
     pending_space: bool,
     trailing_nls: u8,
+    /// Newlines withheld from the output in compressed mode until further
+    /// content arrives. Holding them back keeps blank padding out of the start
+    /// and the end of the document. Unused in normal mode.
+    pending_nls: u8,
+    /// True once any content has reached the output target. Used in compressed
+    /// mode to drop the withheld newlines that would otherwise lead the
+    /// document.
+    wrote_any: bool,
     list_stack: Vec<ListInfo>,
     table_stack: Vec<TableState>,
     code_buf: String,
@@ -204,6 +228,19 @@ struct TableRow {
 
 impl<W: Write> Converter<'_, W> {
     fn finalize(&mut self) -> io::Result<()> {
+        debug_assert!(
+            self.redirect_stack.is_empty(),
+            "finalize called with an open redirect"
+        );
+        if self.compressed {
+            // Withheld newlines are dropped: the document ends with exactly
+            // one newline and no trailing blank line.
+            self.pending_nls = 0;
+            if self.wrote_any {
+                self.out.write_all(b"\n")?;
+            }
+            return Ok(());
+        }
         if self.trailing_nls == 0 {
             self.out.write_all(b"\n")?;
         }
@@ -276,6 +313,27 @@ impl<W: Write> Converter<'_, W> {
         Ok(())
     }
 
+    /// Render `handle`'s children as inline content.
+    ///
+    /// In compressed mode the result is captured and collapsed onto a single
+    /// line, so a block element inside a link, a heading, or an emphasis span
+    /// cannot split the construct across lines. In normal mode the children are
+    /// written straight through.
+    fn walk_inline_children(&mut self, handle: &Handle) -> io::Result<()> {
+        if !self.compressed {
+            return self.walk_children(handle);
+        }
+        self.enter_redirect();
+        let walked = self.walk_children(handle);
+        let Some(state) = self.leave_redirect() else {
+            return walked;
+        };
+        walked?;
+        let mut buf = state.buf;
+        collapse_whitespace(&mut buf);
+        self.raw_write(&buf)
+    }
+
     fn handle_element(
         &mut self,
         tag: &str,
@@ -325,10 +383,10 @@ impl<W: Write> Converter<'_, W> {
         debug_assert!((1..=6).contains(&level));
         self.emit(HASHES[level])?;
         self.emit(" ")?;
-        self.walk_children(handle)?;
-        self.emit("\n\n")?;
-        self.at_line_start = true;
-        Ok(())
+        // A heading holds inline content only; a stray block child must not
+        // break the `#` line in two.
+        self.walk_inline_children(handle)?;
+        self.end_block()
     }
 
     fn handle_paragraph(&mut self, handle: &Handle) -> io::Result<()> {
@@ -337,9 +395,7 @@ impl<W: Write> Converter<'_, W> {
         }
         self.ensure_blank_line()?;
         self.walk_children(handle)?;
-        self.emit("\n\n")?;
-        self.at_line_start = true;
-        Ok(())
+        self.end_block()
     }
 
     fn handle_blockquote(&mut self, handle: &Handle) -> io::Result<()> {
@@ -365,9 +421,7 @@ impl<W: Write> Converter<'_, W> {
             }
             self.emit("\n")?;
         }
-        self.emit("\n")?;
-        self.at_line_start = true;
-        Ok(())
+        self.end_block()
     }
 
     fn handle_pre(&mut self, handle: &Handle) -> io::Result<()> {
@@ -406,6 +460,12 @@ impl<W: Write> Converter<'_, W> {
     fn handle_br(&mut self) -> io::Result<()> {
         if self.in_pre {
             self.emit("\n")?;
+        } else if self.compressed {
+            // A break that starts a line only pads the output; the line it
+            // would end is already ended.
+            if !self.at_line_start {
+                self.emit("  \n")?;
+            }
         } else {
             self.emit("  \n")?;
         }
@@ -477,7 +537,11 @@ impl<W: Write> Converter<'_, W> {
         // marker alone on its own line.
         self.at_item_start = true;
         self.walk_children(handle)?;
-        self.emit("\n")?;
+        // A block child in compressed mode has already ended the line; another
+        // newline here would turn the list loose.
+        if !self.compressed || self.trailing_nls == 0 {
+            self.emit("\n")?;
+        }
         self.at_line_start = true;
         Ok(())
     }
@@ -582,9 +646,7 @@ impl<W: Write> Converter<'_, W> {
                 }
             }
         }
-        self.emit("\n")?;
-        self.at_line_start = true;
-        Ok(())
+        self.end_block()
     }
 
     /// Emit a single table row with no alignment padding: `|a|b|`. Empty cells
@@ -678,7 +740,12 @@ impl<W: Write> Converter<'_, W> {
         let Some(state) = self.leave_redirect() else {
             return Ok(());
         };
-        let buf = state.buf;
+        let mut buf = state.buf;
+        if self.compressed {
+            // Keep the delimiters and their content on one line, whatever the
+            // element wraps.
+            collapse_whitespace(&mut buf);
+        }
         if buf.is_empty() {
             // An empty inline element contributes nothing.
             return Ok(());
@@ -753,7 +820,7 @@ impl<W: Write> Converter<'_, W> {
             .find(|a| &*a.name.local == "href")
             .map(|a| a.value.clone());
         self.emit("[")?;
-        self.walk_children(handle)?;
+        self.walk_inline_children(handle)?;
         self.emit("](")?;
         if let Some(ref h) = href {
             self.emit_url(h)?;
@@ -767,7 +834,7 @@ impl<W: Write> Converter<'_, W> {
         let alt = borrowed.iter().find(|a| &*a.name.local == "alt");
         self.emit("![")?;
         if let Some(a) = alt {
-            self.emit(&a.value)?;
+            self.emit_alt(&a.value)?;
         }
         self.emit("](")?;
         if let Some(s) = src {
@@ -784,13 +851,17 @@ impl<W: Write> Converter<'_, W> {
         if data.is_empty() {
             return Ok(());
         }
-        if let Some(state) = self.redirect_stack.last_mut() {
-            state.buf.extend_from_slice(data);
-        } else {
-            self.out.write_all(data)?;
-        }
+        self.write_all(data)?;
         self.at_line_start = data.last() == Some(&b'\n');
-        self.trailing_nls = 0;
+        // Buffered content can end with newlines of its own; counting them
+        // keeps a following `ensure_blank_line` from stacking another blank
+        // line on top.
+        let nls = trailing_newlines(data);
+        self.trailing_nls = if data.len() > nls as usize {
+            nls
+        } else {
+            self.trailing_nls.saturating_add(nls).min(MAX_BLANK_NLS)
+        };
         Ok(())
     }
 
@@ -805,15 +876,15 @@ impl<W: Write> Converter<'_, W> {
         let bytes = s.as_bytes();
         let all_newlines = bytes.iter().all(|&b| b == b'\n');
         if all_newlines {
-            let needed = 2usize.saturating_sub(self.trailing_nls as usize);
+            let needed = usize::from(MAX_BLANK_NLS).saturating_sub(self.trailing_nls as usize);
             let to_write = bytes.len().min(needed);
             if to_write > 0 {
                 self.write_all(&bytes[..to_write])?;
             }
-            // `to_write` is bounded by `needed` (<= 2), so it always fits in a
-            // u8; the fallback is never used.
-            let added = u8::try_from(to_write).unwrap_or(2);
-            self.trailing_nls = (self.trailing_nls + added).min(2);
+            // `to_write` is bounded by `needed` (<= MAX_BLANK_NLS), so it
+            // always fits in a u8; the fallback is never used.
+            let added = u8::try_from(to_write).unwrap_or(MAX_BLANK_NLS);
+            self.trailing_nls = self.trailing_nls.saturating_add(added).min(MAX_BLANK_NLS);
             self.at_line_start = true;
             return Ok(());
         }
@@ -823,20 +894,12 @@ impl<W: Write> Converter<'_, W> {
         if self.at_item_start && bytes.iter().any(|&b| !b.is_ascii_whitespace()) {
             self.at_item_start = false;
         }
-        let len = bytes.len();
-        let mut nls: u8 = 0;
-        for &b in bytes.iter().rev().take(2) {
-            if b == b'\n' {
-                nls += 1;
-            } else {
-                break;
-            }
-        }
+        let nls = trailing_newlines(bytes);
         if nls > 0 {
-            if len > nls as usize {
+            if bytes.len() > nls as usize {
                 self.trailing_nls = nls;
             } else {
-                self.trailing_nls = (self.trailing_nls + nls).min(2);
+                self.trailing_nls = self.trailing_nls.saturating_add(nls).min(MAX_BLANK_NLS);
             }
         } else {
             self.trailing_nls = 0;
@@ -846,21 +909,51 @@ impl<W: Write> Converter<'_, W> {
     }
 
     fn write_one(&mut self, b: u8) -> io::Result<()> {
-        if let Some(state) = self.redirect_stack.last_mut() {
-            state.buf.push(b);
-        } else {
-            let buf = [b];
-            self.out.write_all(&buf)?;
-        }
-        Ok(())
+        let buf = [b];
+        self.write_all(&buf)
     }
 
     fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
         if let Some(state) = self.redirect_stack.last_mut() {
             state.buf.extend_from_slice(data);
-        } else {
-            self.out.write_all(data)?;
+            return Ok(());
         }
+        if self.compressed {
+            return self.write_compact(data);
+        }
+        self.out.write_all(data)
+    }
+
+    /// Write `data` to the output target, holding back the trailing run of
+    /// newlines instead of writing it immediately.
+    ///
+    /// Deferring the run keeps the document free of leading and trailing blank
+    /// padding, and caps any run that survives at [`MAX_BLANK_NLS`], even when
+    /// the run is assembled from several writes (buffered content flushed with
+    /// [`Converter::raw_write`], for example). Newlines inside `data` are
+    /// written unchanged, so fenced code blocks keep their blank lines.
+    fn write_compact(&mut self, data: &[u8]) -> io::Result<()> {
+        debug_assert!(self.compressed, "write_compact used in normal mode");
+        debug_assert!(
+            self.pending_nls <= MAX_BLANK_NLS,
+            "pending newline run exceeds the cap"
+        );
+        let end = data.iter().rposition(|&b| b != b'\n').map_or(0, |i| i + 1);
+        let (content, newlines) = data.split_at(end);
+        if !content.is_empty() {
+            if self.wrote_any {
+                for _ in 0..self.pending_nls {
+                    self.out.write_all(b"\n")?;
+                }
+            }
+            self.pending_nls = 0;
+            self.out.write_all(content)?;
+            self.wrote_any = true;
+        }
+        // `newlines.len()` is bounded by the write size; saturating conversion
+        // then clamping to the cap keeps the count in range for any input.
+        let added = u8::try_from(newlines.len()).unwrap_or(MAX_BLANK_NLS);
+        self.pending_nls = self.pending_nls.saturating_add(added).min(MAX_BLANK_NLS);
         Ok(())
     }
 
@@ -879,6 +972,37 @@ impl<W: Write> Converter<'_, W> {
             n /= 10;
         }
         self.write_all(&buf[pos..])
+    }
+
+    /// Emit an image's alt text. In compressed mode whitespace runs collapse to
+    /// a single space so the `![...]` label stays on one line; an attribute
+    /// value may hold newlines of its own.
+    fn emit_alt(&mut self, alt: &str) -> io::Result<()> {
+        if alt.is_empty() {
+            return Ok(());
+        }
+        if !self.compressed {
+            return self.emit(alt);
+        }
+        self.text_buf.clear();
+        let mut pending = false;
+        for ch in alt.chars() {
+            if ch.is_whitespace() {
+                pending = !self.text_buf.is_empty();
+                continue;
+            }
+            if pending {
+                self.text_buf.push(' ');
+                pending = false;
+            }
+            self.text_buf.push(ch);
+        }
+        let buf = std::mem::take(&mut self.text_buf);
+        if !buf.is_empty() {
+            self.emit(&buf)?;
+        }
+        self.text_buf = buf;
+        Ok(())
     }
 
     /// Emit a link/image destination URL, wrapping it in angle brackets and
@@ -968,6 +1092,13 @@ impl<W: Write> Converter<'_, W> {
         if self.at_item_start {
             return Ok(());
         }
+        if self.tight_block() {
+            if self.trailing_nls == 0 {
+                self.emit("\n")?;
+            }
+            self.at_line_start = true;
+            return Ok(());
+        }
         match self.trailing_nls {
             0 => self.emit("\n\n")?,
             1 => self.emit("\n")?,
@@ -975,6 +1106,27 @@ impl<W: Write> Converter<'_, W> {
         }
         self.at_line_start = true;
         Ok(())
+    }
+
+    /// Close a block element, leaving the output at the start of a line.
+    fn end_block(&mut self) -> io::Result<()> {
+        if self.tight_block() {
+            if self.trailing_nls == 0 {
+                self.emit("\n")?;
+            }
+        } else {
+            self.emit("\n\n")?;
+        }
+        self.at_line_start = true;
+        Ok(())
+    }
+
+    /// Returns `true` when the current block must be separated by a single
+    /// newline instead of a blank line: compressed mode keeps lists tight, so
+    /// blocks inside a list item stay on consecutive lines.
+    #[inline]
+    fn tight_block(&self) -> bool {
+        self.compressed && !self.list_stack.is_empty()
     }
 }
 
@@ -1015,6 +1167,51 @@ fn collect_text_recursive(handle: &Handle, out: &mut String, depth: u32) -> io::
         _ => {}
     }
     Ok(())
+}
+
+/// Returns the number of newlines at the end of `data`, capped at
+/// [`MAX_BLANK_NLS`].
+fn trailing_newlines(data: &[u8]) -> u8 {
+    let mut nls: u8 = 0;
+    for &b in data.iter().rev().take(MAX_BLANK_NLS as usize) {
+        if b != b'\n' {
+            break;
+        }
+        nls += 1;
+    }
+    debug_assert!(nls <= MAX_BLANK_NLS, "count is bounded by the cap");
+    nls
+}
+
+/// Collapse every run of ASCII whitespace in `buf` to a single space and drop
+/// the leading and trailing runs, in place.
+///
+/// Operating on bytes is safe for UTF-8 input because the bytes of a multi-byte
+/// sequence are all >= 0x80 and therefore never ASCII whitespace.
+fn collapse_whitespace(buf: &mut Vec<u8>) {
+    let mut write = 0;
+    let mut pending = false;
+    for read in 0..buf.len() {
+        let b = buf[read];
+        if b.is_ascii_whitespace() {
+            // A leading run is dropped rather than turned into a space.
+            pending = write > 0;
+            continue;
+        }
+        if pending {
+            buf[write] = b' ';
+            write += 1;
+            pending = false;
+        }
+        buf[write] = b;
+        write += 1;
+        debug_assert!(write <= read + 1, "output never overtakes the read index");
+    }
+    buf.truncate(write);
+    debug_assert!(
+        !buf.contains(&b'\n'),
+        "collapsed content must be a single line"
+    );
 }
 
 /// Returns `true` when `needle` occurs anywhere in `haystack`. A byte-level
